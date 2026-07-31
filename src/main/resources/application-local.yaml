@@ -1,0 +1,21 @@
+#내 컴퓨터에서 실행할 때 사용하는 H2 설정
+spring:
+  datasource:
+    url: jdbc:h2:mem:memberdb        # 메모리 안에 임시 DB (껐다 켜면 초기화)
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop                # 앱 켤 때 테이블 자동 생성, 끌 때 삭제 (테스트용)
+    show-sql: true                         # 실행되는 SQL을 콘솔에 보여줌 (공부에 좋음)
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true                   # SQL을 보기 좋게 줄맞춤
+
+  h2:
+    console:
+      enabled: true                         # 브라우저로 H2 DB 들여다보는 콘솔 켜기
+      path: /h2-console
