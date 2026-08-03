@@ -4,10 +4,20 @@ spring:
     name: member-profile-service
 
   profiles:
-    default: local       # ← 기본 스위치를 local에 둔다 (내 PC에선 H2)
+    default: local  # 기본 실행 환경은 local
+
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
 
 management:
   endpoints:
     web:
       exposure:
-        include: health   # ← /actuator/health 를 외부에 노출 (발제 요구사항)
+        include: health  # /actuator/health 외부 노출
+
+aws:
+  region: ap-northeast-2
+  s3:
+    bucket: member-profile-images-370835058925

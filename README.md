@@ -1287,3 +1287,700 @@ http://{EC2_PUBLIC_IP}:8080/actuator/info
 - IAM Role을 통해 Access Key 없이도 EC2가 AWS 서비스를 사용할 수 있다는 것을 학습하였다.
 - Spring Boot가 Parameter Store를 직접 조회하는 것이 아니라, EC2가 IAM Role 권한으로 Parameter Store 값을 조회하여 환경변수로 전달하고 Spring Boot가 이를 사용하는 구조를 이해하였다.
 - `/actuator/info`를 이용하여 운영 환경의 설정값이 정상적으로 주입되었는지 검증하는 방법을 학습하였다.
+
+---
+
+# LV3. 프로필 이미지 업로드 및 권한 관리
+
+## 목표
+
+프로필 이미지를 서버 내부에 저장하지 않고 AWS S3에 저장하도록 구성하였다.
+
+또한 Access Key를 코드에 직접 작성하지 않고 IAM Role을 이용하여 S3에 접근하도록 구성하였으며, Presigned URL을 사용하여 일정 기간 동안만 이미지를 다운로드할 수 있도록 구현하였다.
+
+---
+
+## 구현 내용
+
+- S3 Bucket 생성
+- Public Access Block 활성화
+- EC2 IAM Role에 S3 권한 추가
+- AWS SDK for Java(S3) 적용
+- S3Config 구성
+- Member Entity에 S3 객체 Key 저장
+- MultipartFile 업로드 API 구현
+- Presigned URL 생성 API 구현
+- 브라우저 접근 검증
+
+---
+
+## 1. S3 Bucket 생성
+
+### 구현 내용
+
+프로필 이미지를 저장하기 위한 S3 Bucket을 생성하였다.
+
+설정 내용은 다음과 같다.
+
+- Bucket Name
+  - `member-profile-images-370835058925`
+
+- Region
+  - `ap-northeast-2`
+
+- Object Ownership
+  - ACL 비활성화
+
+- Versioning
+  - 비활성화
+
+- Server Side Encryption
+  - SSE-S3
+
+---
+
+### 왜 S3를 사용하는가?
+
+EC2 내부에 이미지를 저장하면 인스턴스가 삭제되거나 교체될 경우 이미지도 함께 사라질 수 있다.
+
+반면 S3는 객체(Object)를 저장하기 위한 AWS의 스토리지 서비스로, 애플리케이션 서버와 분리하여 파일을 안전하게 관리할 수 있다.
+
+이미지는 EC2가 아니라 S3에 저장하고, Spring Boot는 이미지의 위치만 관리하도록 구성하였다.
+
+---
+
+### 처리 흐름
+
+```text
+Multipart Image
+
+↓
+
+Amazon S3
+
+↓
+
+Object 저장
+
+↓
+
+Spring Boot
+```
+
+---
+
+### 스크린샷
+
+![S3 Bucket](docs/images/lv3-s3-bucket.png)
+
+---
+
+## 2. IAM Role 및 S3 권한 구성
+
+### 구현 내용
+
+기존 EC2 IAM Role(`member-profile-ec2-role`)에 S3 접근 권한을 추가하였다.
+
+연결한 권한은 다음과 같다.
+
+- AmazonSSMReadOnlyAccess
+- AmazonS3FullAccess
+
+새로운 IAM Role을 생성하지 않고 기존 EC2 Role에 필요한 권한만 추가하였다.
+
+---
+
+### 왜 IAM Role을 사용하는가?
+
+AWS Access Key를 코드나 설정 파일에 직접 저장하면 보안상 위험하다.
+
+IAM Role을 사용하면 EC2 인스턴스가 실행되는 동안 필요한 권한만 자동으로 부여받을 수 있다.
+
+Spring Boot는 Access Key를 알 필요 없이 IAM Role을 통해 S3에 접근할 수 있다.
+
+---
+
+### 처리 흐름
+
+```text
+EC2
+
+↓
+
+IAM Role
+
+↓
+
+AmazonS3FullAccess
+
+↓
+
+Amazon S3
+```
+
+---
+
+### 스크린샷
+
+![IAM Role](docs/images/lv3-iam-role.png)
+
+---
+
+## 3. AWS SDK 및 S3Config 구성
+
+### 구현 내용
+
+Spring Boot 애플리케이션에서 S3 업로드와 Presigned URL 생성을 처리하기 위해 AWS SDK for Java 2.x의 S3 모듈을 추가하였다.
+
+`build.gradle`
+
+```gradle
+implementation platform('software.amazon.awssdk:bom:2.42.36')
+implementation 'software.amazon.awssdk:s3'
+```
+
+또한 S3 업로드와 Presigned URL 생성을 담당하는 객체를 Spring Bean으로 등록하였다.
+
+```java
+@Configuration
+public class S3Config {
+
+    @Value("${aws.region}")
+    private String region;
+
+    @Bean
+    public S3Client s3Client() {
+        return S3Client.builder()
+                .region(Region.of(region))
+                .credentialsProvider(DefaultCredentialsProvider.create())
+                .build();
+    }
+
+    @Bean
+    public S3Presigner s3Presigner() {
+        return S3Presigner.builder()
+                .region(Region.of(region))
+                .credentialsProvider(DefaultCredentialsProvider.create())
+                .build();
+    }
+}
+```
+
+---
+
+### 왜 `S3Client`와 `S3Presigner`를 분리하는가?
+
+두 객체의 역할이 다르기 때문이다.
+
+```text
+S3Client
+→ 이미지 업로드
+
+S3Presigner
+→ Presigned URL 생성
+```
+
+`S3Client`는 실제 파일을 S3에 저장할 때 사용하고, `S3Presigner`는 비공개 객체에 일정 시간 동안 접근할 수 있는 URL을 생성할 때 사용한다.
+
+---
+
+### 왜 `DefaultCredentialsProvider`를 사용하는가?
+
+`DefaultCredentialsProvider`는 실행 환경에서 사용할 수 있는 AWS 자격 증명을 자동으로 찾는다.
+
+EC2 환경에서는 인스턴스에 연결한 IAM Role의 임시 자격 증명을 사용하므로, Access Key와 Secret Key를 코드에 직접 작성할 필요가 없다.
+
+```text
+Spring Boot
+
+↓
+
+DefaultCredentialsProvider
+
+↓
+
+EC2 IAM Role
+
+↓
+
+AWS S3 접근
+```
+
+---
+
+## 4. 공통 S3 설정 및 Multipart 제한
+
+### 구현 내용
+
+S3 설정은 모든 실행 환경에서 사용할 수 있도록 공통 `application.yaml`에 작성하였다.
+
+```yaml
+spring:
+  application:
+    name: member-profile-service
+
+  profiles:
+    default: local
+
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+aws:
+  region: ap-northeast-2
+  s3:
+    bucket: member-profile-images-370835058925
+```
+
+---
+
+### 왜 공통 설정 파일에 작성했는가?
+
+`S3Config`는 특정 프로파일에만 제한하지 않고 Spring Context가 생성될 때 함께 로딩된다.
+
+따라서 `aws.region`과 `aws.s3.bucket` 값을 운영 환경 설정 파일에만 작성하면, 로컬 실행이나 테스트 과정에서 설정값을 찾지 못할 수 있다.
+
+리전과 버킷 이름은 비밀번호와 같은 민감정보가 아니므로 공통 설정 파일에서 관리하였다.
+
+---
+
+### 왜 Multipart 크기 제한을 변경했는가?
+
+Spring Boot의 기본 파일 업로드 제한보다 큰 이미지를 받을 수 있도록 최대 파일 크기를 10MB로 설정하였다.
+
+```text
+단일 파일 최대 크기
+10MB
+
+전체 요청 최대 크기
+10MB
+```
+
+---
+
+## 5. Member Entity에 S3 객체 Key 저장
+
+### 구현 내용
+
+`Member` Entity에 프로필 이미지 정보를 저장하기 위한 필드를 추가하였다.
+
+```java
+private String profileImageKey;
+```
+
+프로필 이미지가 업로드되면 다음과 같은 값을 저장한다.
+
+```text
+profile-images/1/507289a6-239c-40e5-8986-78b9a68d718c-image.jpg
+```
+
+이미지 Key를 변경하기 위한 메서드도 추가하였다.
+
+```java
+public void updateProfileImageKey(String profileImageKey) {
+    this.profileImageKey = profileImageKey;
+}
+```
+
+---
+
+### 왜 이미지 URL이 아니라 S3 객체 Key를 저장하는가?
+
+Presigned URL은 유효기간이 지나면 사용할 수 없으며, 새로 생성할 때마다 값이 달라진다.
+
+따라서 만료되는 URL을 DB에 저장하지 않고, 변하지 않는 S3 객체 Key만 저장하였다.
+
+```text
+DB
+
+↓
+
+profileImageKey 저장
+
+↓
+
+GET 요청
+
+↓
+
+새 Presigned URL 생성
+```
+
+즉, DB에는 이미지의 고정된 위치만 저장하고, 실제 접근 URL은 요청 시점에 새로 생성한다.
+
+---
+
+## 6. 프로필 이미지 업로드 API
+
+### API
+
+```http
+POST /api/members/{id}/profile-image
+```
+
+### 요청 형식
+
+```text
+Content-Type: multipart/form-data
+```
+
+| Key | Type | 설명 |
+|---|---|---|
+| `file` | File | 업로드할 프로필 이미지 |
+
+---
+
+### 구현 내용
+
+`MultipartFile`로 이미지를 전달받아 S3에 업로드하였다.
+
+```java
+@PostMapping("/{id}/profile-image")
+public ResponseEntity<String> uploadProfileImage(
+        @PathVariable Long id,
+        @RequestParam("file") MultipartFile file
+) {
+    String profileImageKey =
+            memberService.uploadProfileImage(id, file);
+
+    return ResponseEntity.ok(profileImageKey);
+}
+```
+
+S3 객체 Key는 중복을 방지하기 위해 UUID를 포함하여 생성하였다.
+
+```text
+profile-images/{memberId}/{UUID}-{originalFilename}
+```
+
+예시:
+
+```text
+profile-images/1/507289a6-239c-40e5-8986-78b9a68d718c-KakaoTalk_20260526_101819469.jpg
+```
+
+---
+
+### 업로드 처리 흐름
+
+```text
+클라이언트
+
+↓
+
+MultipartFile
+
+↓
+
+Spring Boot
+
+↓
+
+파일 검증
+
+↓
+
+UUID 기반 S3 Key 생성
+
+↓
+
+S3Client.putObject()
+
+↓
+
+S3 업로드
+
+↓
+
+Member.profileImageKey 저장
+
+↓
+
+RDS 반영
+```
+
+---
+
+### 파일 검증
+
+다음 조건을 확인하도록 구성하였다.
+
+- 파일이 비어 있지 않은지 확인
+- Content-Type이 이미지인지 확인
+- 원본 파일명에 포함된 특수 문자를 안전한 문자로 변경
+
+---
+
+### 스크린샷
+
+![Profile Image Upload Success](docs/images/lv3-profile-upload-success.png)
+
+---
+
+## 7. Presigned URL 생성 API
+
+### API
+
+```http
+GET /api/members/{id}/profile-image
+```
+
+---
+
+### 구현 내용
+
+DB에 저장된 S3 객체 Key를 이용하여 Presigned URL을 생성하도록 구현하였다.
+
+```java
+@GetMapping("/{id}/profile-image")
+public ResponseEntity<String> getProfileImage(
+        @PathVariable Long id
+) {
+    return ResponseEntity.ok(
+            memberService.getProfileImagePresignedUrl(id)
+    );
+}
+```
+
+Presigned URL 생성 시 유효기간은 발제 요구사항에 맞게 **7일**로 설정하였다.
+
+```java
+GetObjectPresignRequest presignRequest =
+        GetObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofDays(7))
+                .getObjectRequest(getObjectRequest)
+                .build();
+```
+
+---
+
+### 왜 Presigned URL을 사용하는가?
+
+S3 Bucket은 "모든 퍼블릭 액세스 차단"을 활성화한 상태로 생성하였다.
+
+따라서 이미지를 인터넷에 공개하는 Public URL을 사용할 수 없다.
+
+대신 필요한 사용자에게만 일정 시간 동안 접근 권한을 부여하기 위해 Presigned URL을 사용하였다.
+
+Presigned URL은 일정 시간이 지나면 자동으로 사용할 수 없게 되므로 보안성이 높다.
+
+---
+
+### 왜 DB에 Presigned URL을 저장하지 않는가?
+
+Presigned URL은 요청할 때마다 새롭게 생성되며 시간이 지나면 만료된다.
+
+따라서 DB에는 변경되지 않는 S3 객체 Key만 저장하고,
+
+클라이언트가 이미지를 요청하는 시점마다 새로운 Presigned URL을 생성하도록 구성하였다.
+
+```text
+RDS
+
+↓
+
+profileImageKey
+
+↓
+
+GET 요청
+
+↓
+
+S3Presigner
+
+↓
+
+7일짜리 Presigned URL 생성
+
+↓
+
+클라이언트 반환
+```
+
+---
+
+### Presigned URL 검증
+
+생성된 URL의 Query Parameter를 확인한 결과,
+
+```text
+X-Amz-Expires=604800
+```
+
+값이 포함되어 있었으며,
+
+604800초(7일)로 설정된 것을 확인하였다.
+
+---
+
+### 접근 검증
+
+브라우저에서 Presigned URL로 접속하여 이미지가 정상적으로 출력되는 것을 확인하였다.
+
+IAM Role을 사용하여 S3에 접근하였기 때문에 Access Key를 코드에 작성하지 않고도 이미지 업로드 및 조회가 정상적으로 수행되었다.
+
+---
+
+### 스크린샷
+
+![Presigned URL Success](docs/images/lv3-presigned-url-success.png)
+
+---
+
+# 구현 결과
+
+- S3 Bucket을 생성하여 이미지 저장소를 구성하였다.
+- EC2 IAM Role에 S3 권한을 추가하여 Access Key 없이 S3에 접근하도록 구성하였다.
+- AWS SDK for Java(S3)를 적용하여 이미지 업로드 기능을 구현하였다.
+- MultipartFile을 이용하여 프로필 이미지를 S3에 업로드하도록 구현하였다.
+- 업로드한 이미지의 S3 객체 Key를 RDS에 저장하도록 구성하였다.
+- GET 요청 시 Presigned URL을 생성하여 이미지를 다운로드할 수 있도록 구현하였다.
+- Presigned URL 유효기간을 7일(604800초)로 설정하였다.
+- 브라우저를 통해 Presigned URL 접근이 정상적으로 동작하는 것을 확인하였다.
+
+---
+
+# LV3 전체 처리 흐름
+
+```text
+Client
+
+↓
+
+MultipartFile
+
+↓
+
+Spring Boot
+
+↓
+
+S3Client
+
+↓
+
+Amazon S3
+
+↓
+
+S3 객체 Key 생성
+
+↓
+
+RDS 저장
+
+↓
+
+GET 요청
+
+↓
+
+profileImageKey 조회
+
+↓
+
+S3Presigner
+
+↓
+
+7일짜리 Presigned URL 생성
+
+↓
+
+Browser
+
+↓
+
+이미지 출력
+```
+
+---
+
+# API 명세
+
+| Method | URI | Description |
+|---------|-----|-------------|
+| POST | `/api/members` | 팀원 등록 |
+| GET | `/api/members/{id}` | 팀원 조회 |
+| POST | `/api/members/{id}/profile-image` | 프로필 이미지 업로드 |
+| GET | `/api/members/{id}/profile-image` | Presigned URL 생성 |
+
+---
+
+# 실행 방법
+
+## 1. 프로젝트 빌드
+
+```bash
+./gradlew clean build
+```
+
+---
+
+## 2. EC2로 JAR 전송
+
+```bash
+scp -i ~/.ssh/member-profile-key.pem \
+build/libs/member-profile-service-0.0.1-SNAPSHOT.jar \
+ec2-user@{EC2_PUBLIC_IP}:~
+```
+
+---
+
+## 3. Parameter Store 환경변수 등록
+
+```bash
+export DB_URL=...
+export DB_USERNAME=...
+export DB_PASSWORD=...
+export TEAM_NAME=...
+```
+
+---
+
+## 4. Spring Boot 실행
+
+```bash
+java -Dspring.profiles.active=prod \
+     -jar member-profile-service-0.0.1-SNAPSHOT.jar
+```
+
+---
+
+## 5. 이미지 업로드 테스트
+
+```http
+POST /api/members/{id}/profile-image
+```
+
+Body
+
+```text
+multipart/form-data
+
+Key : file
+Type : File
+```
+
+---
+
+## 6. Presigned URL 확인
+
+```http
+GET /api/members/{id}/profile-image
+```
+
+---
+
+# 레벨 3 단계에서 배운 점
+
+- S3를 이용하여 애플리케이션 서버와 파일 저장소를 분리하는 방법을 학습하였다.
+- IAM Role을 이용하면 Access Key 없이도 EC2가 AWS 서비스에 안전하게 접근할 수 있다는 것을 이해하였다.
+- AWS SDK를 이용하여 Spring Boot에서 S3 객체를 업로드하는 방법을 학습하였다.
+- Presigned URL을 이용하면 비공개 S3 객체를 일정 기간 동안만 안전하게 공유할 수 있다는 것을 이해하였다.
+- DB에는 Presigned URL이 아니라 변경되지 않는 S3 객체 Key를 저장하고, 요청 시 새로운 Presigned URL을 생성하는 구조를 학습하였다.
+- MultipartFile을 이용한 이미지 업로드와 S3 연동 과정을 직접 구현하고 검증하였다.
+
+---
